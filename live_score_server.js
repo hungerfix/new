@@ -1,0 +1,2040 @@
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const url = require('url');
+const zlib = require('zlib');
+const { Server } = require('socket.io');
+
+// ========== CRASH PROTECTION ==========
+process.on('uncaughtException', (err) => {
+  console.error('[CRASH GUARD] Uncaught Exception (server kept alive):', err.message);
+});
+process.on('unhandledRejection', (err) => {
+  console.error('[CRASH GUARD] Unhandled Rejection (server kept alive):', err?.message || err);
+});
+
+// Support: command-line arg > environment variable > interactive prompt
+let matchUrl = process.argv[2] || process.env.MATCH_URL;
+
+// Detect provider from URL
+function detectProvider(u) {
+  if (!u) return 'none';
+  if (u.includes('crex.com')) return 'crex';
+  if (u.includes('heroliveline.com')) return 'hero';
+  if (u.includes('cricketfastliveline.in')) return 'cfll';
+  return 'cricbuzz';
+}
+
+// Enriched score data structure supporting both innings
+let scoreData = {
+  provider: 'none',
+  matchInfo: {
+    description: '',
+    format: '',
+    status: 'Loading...',
+    venue: '',
+    state: '',
+    toss: '',
+    result: ''
+  },
+  team1: { name: '--', shortName: '--', id: 0, flagUrl: '', jerseyUrl: '', gradient: '' },
+  team2: { name: '--', shortName: '--', id: 0, flagUrl: '', jerseyUrl: '', gradient: '' },
+  currentInnings: 0,
+  innings: [],
+  miniscore: null,
+  crexRaw: null,
+  timestamp: new Date().toISOString(),
+  error: null
+};
+
+// TTS State and Configuration
+let ttsEnabled = true;
+let lastReadCommentaryEvent = null; // Track last read commentary to avoid repeats
+let lastProcessedBallKey = null; // Robust tracking: over.ball
+let lastReadCommentaryText = null;
+
+const PORT = process.env.PORT || 5555;
+
+console.log(`🏏 Cricket Score Server starting on port ${PORT}...`);
+console.log(`📊 Dashboard: http://localhost:${PORT}/dashboard.html`);
+console.log(`🎯 Overlay:   http://localhost:${PORT}/overlay`);
+
+// Custom overlays directory
+const CUSTOM_OVERLAYS_DIR = path.join(__dirname, 'custom_overlays');
+if (!fs.existsSync(CUSTOM_OVERLAYS_DIR)) {
+  fs.mkdirSync(CUSTOM_OVERLAYS_DIR, { recursive: true });
+}
+
+// Extract match ID from Cricbuzz URL
+function extractMatchId(matchUrl) {
+  const match = matchUrl.match(/live-cricket-scores\/(\d+)|cricket-match\/(\d+)|\/(\d+)\//);
+  return match ? (match[1] || match[2] || match[3]) : null;
+}
+
+// Fetch JSON from URL
+function fetchUrl(fetchUrl) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('Timeout')), 8000);
+
+    https.get(fetchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.5',
+      },
+      timeout: 8000
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => {
+        data += chunk;
+        if (data.length > 800000) res.destroy();
+      });
+      res.on('end', () => {
+        clearTimeout(timeout);
+        resolve(data);
+      });
+    }).on('error', (e) => {
+      clearTimeout(timeout);
+      reject(e);
+    });
+  });
+}
+
+// Parse the React Server Components (RSC) payload from Cricbuzz page
+function parseRSCPayload(html) {
+  const result = {
+    miniscore: null,
+    matchHeader: null,
+    commentary: [],
+    matchScoreDetails: null
+  };
+
+  // Extract RSC push payloads manually (format: self.__next_f.push([1,"CONTENT"]))
+  // Content contains escaped quotes \" and ends at unescaped "])
+  const pushes = [];
+  const marker = 'self.__next_f.push([1,"';
+  let searchStart = 0;
+  let loopCount = 0;
+  const MAX_LOOPS = 5000;
+
+  while (true) {
+    if (++loopCount > MAX_LOOPS) { console.warn('[SAFETY] RSC parser hit iteration limit'); break; }
+    const idx = html.indexOf(marker, searchStart);
+    if (idx < 0) break;
+    const contentStart = idx + marker.length;
+
+    // Find closing "]) handling escaped quotes
+    let pos = contentStart;
+    let found = false;
+    while (pos < html.length) {
+      const endIdx = html.indexOf('"])', pos);
+      if (endIdx < 0) break;
+      // Count preceding backslashes
+      let bs = 0;
+      let check = endIdx - 1;
+      while (check >= contentStart && html[check] === '\\') { bs++; check--; }
+      if (bs % 2 === 0) {
+        pushes.push(html.substring(contentStart, endIdx));
+        found = true;
+        searchStart = endIdx + 3;
+        break;
+      }
+      pos = endIdx + 1;
+    }
+    if (!found) searchStart = idx + 1;
+  }
+
+  for (const raw of pushes) {
+    if (raw.length < 500) continue;
+
+    // Unescape: \" → " and \\ → \ and \n → newline
+    const cleaned = raw.replace(/\\"/g, '"').replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\\\/g, '\\');
+
+    // Look for miniscore data
+    if (cleaned.includes('"miniscore"') && !result.miniscore) {
+      try {
+        const miniIdx = cleaned.indexOf('"miniscore":');
+        const objStart = cleaned.indexOf('{', miniIdx);
+        let depth = 0, objEnd = objStart;
+        for (let i = objStart; i < cleaned.length; i++) {
+          if (cleaned[i] === '{') depth++;
+          if (cleaned[i] === '}') depth--;
+          if (depth === 0) { objEnd = i + 1; break; }
+        }
+        const miniJson = cleaned.substring(objStart, objEnd);
+        const fixedJson = miniJson.replace(/"\$undefined"/g, 'null').replace(/\$undefined/g, 'null');
+        result.miniscore = JSON.parse(fixedJson);
+      } catch (e) {
+        console.log('  Miniscore parse error:', e.message);
+      }
+    }
+
+    // Look for matchHeader data
+    if (cleaned.includes('"matchHeader"') && !result.matchHeader) {
+      try {
+        const headerIdx = cleaned.indexOf('"matchHeader":');
+        const objStart = cleaned.indexOf('{', headerIdx);
+        let depth = 0, objEnd = objStart;
+        for (let i = objStart; i < cleaned.length; i++) {
+          if (cleaned[i] === '{') depth++;
+          if (cleaned[i] === '}') depth--;
+          if (depth === 0) { objEnd = i + 1; break; }
+        }
+        const headerJson = cleaned.substring(objStart, objEnd);
+        const fixedJson = headerJson.replace(/"\$undefined"/g, 'null').replace(/\$undefined/g, 'null');
+        result.matchHeader = JSON.parse(fixedJson);
+      } catch (e) {
+        console.log('  MatchHeader parse error:', e.message);
+      }
+    }
+
+    // Extract commentary entries
+    if (cleaned.includes('"commType"') && cleaned.includes('"matchCommentary"')) {
+      try {
+        // Find the matchCommentary object
+        const commIdx = cleaned.indexOf('"matchCommentary":');
+        if (commIdx >= 0) {
+          const objStart = cleaned.indexOf('{', commIdx);
+          let depth = 0, objEnd = objStart;
+          for (let i = objStart; i < cleaned.length; i++) {
+            if (cleaned[i] === '{') depth++;
+            if (cleaned[i] === '}') depth--;
+            if (depth === 0) { objEnd = i + 1; break; }
+          }
+          const commJson = cleaned.substring(objStart, objEnd);
+          const fixedJson = commJson.replace(/"\$undefined"/g, 'null').replace(/\$undefined/g, 'null');
+          const commObj = JSON.parse(fixedJson);
+
+          // Each key is a timestamp, value is the commentary entry
+          for (const [ts, entry] of Object.entries(commObj)) {
+            if (entry && entry.commType) {
+              result.commentary.push({
+                type: entry.commType,
+                text: entry.commText ? entry.commText.replace(/<[^>]+>/g, '').substring(0, 300) : '',
+                inningsId: entry.inningsId,
+                event: entry.event,
+                teamName: entry.teamName,
+                timestamp: entry.timestamp || parseInt(ts),
+                batsmanName: entry.batsmanDetails?.playerName || '',
+                bowlerName: entry.bowlerDetails?.playerName || '',
+                overSeparator: entry.overSeparator || null
+              });
+            }
+          }
+        }
+      } catch (e) {
+        console.log('  Commentary parse error:', e.message);
+      }
+    }
+  }
+
+  return result;
+}
+
+// Also try to extract scorecard data from the scorecard page
+async function fetchScorecardPage(matchId) {
+  try {
+    // Try to get the scorecard page URL pattern
+    const scUrl = matchUrl.replace('/live-cricket-scores/', '/live-cricket-scorecard/');
+    const html = await fetchUrl(scUrl);
+
+    const scorecard = { innings: [] };
+
+    // Extract scorecard from RSC payload
+    const pushRegex = /self\.__next_f\.push\(\[1,"(.*?)"\]\)/gs;
+    let match;
+
+    while ((match = pushRegex.exec(html)) !== null) {
+      const raw = match[1];
+      if (raw.length < 1000) continue;
+
+      // Look for scoreCard data
+      if (raw.includes('"scoreCard"') || raw.includes('"batTeamDetails"')) {
+        try {
+          const cleaned = raw.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+
+          // Extract innings scorecard data - look for batTeamDetails
+          const batTeamRegex = /"batTeamDetails":\{"batTeamId":(\d+),"batTeamName":"([^"]+)","batTeamShortName":"([^"]+)"/g;
+          let btMatch;
+          while ((btMatch = batTeamRegex.exec(cleaned)) !== null) {
+            // Found an innings batting details block
+            const inningsBlock = cleaned.substring(btMatch.index - 200, Math.min(cleaned.length, btMatch.index + 10000));
+
+            // Extract innings ID
+            const innIdMatch = inningsBlock.match(/"scoreCardId":(\d+)|"inningsId":(\d+)/);
+            const inningsId = innIdMatch ? parseInt(innIdMatch[1] || innIdMatch[2]) : scorecard.innings.length + 1;
+
+            // Extract individual batsmen
+            const batsmen = [];
+            const batsmanRegex = /"batName":"([^"]+)"[^}]*?"runs":(\d+)[^}]*?"balls":(\d+)[^}]*?"fours":(\d+)[^}]*?"sixes":(\d+)[^}]*?"strikeRate":"?([0-9.]+)"?[^}]*?"outDesc":"([^"]*)"/g;
+            let batMatch;
+            const searchBlock = cleaned.substring(btMatch.index, Math.min(cleaned.length, btMatch.index + 15000));
+            while ((batMatch = batsmanRegex.exec(searchBlock)) !== null) {
+              batsmen.push({
+                name: batMatch[1],
+                runs: parseInt(batMatch[2]),
+                balls: parseInt(batMatch[3]),
+                fours: parseInt(batMatch[4]),
+                sixes: parseInt(batMatch[5]),
+                strikeRate: parseFloat(batMatch[6]),
+                dismissal: batMatch[7]
+              });
+            }
+
+            // Extract bowlers
+            const bowlers = [];
+            const bowlerRegex = /"bowlName":"([^"]+)"[^}]*?"overs":"?([0-9.]+)"?[^}]*?"maidens":(\d+)[^}]*?"runs":(\d+)[^}]*?"wickets":(\d+)[^}]*?"economy":"?([0-9.]+)"?/g;
+            let bowlMatch;
+            while ((bowlMatch = bowlerRegex.exec(searchBlock)) !== null) {
+              bowlers.push({
+                name: bowlMatch[1],
+                overs: bowlMatch[2],
+                maidens: parseInt(bowlMatch[3]),
+                runs: parseInt(bowlMatch[4]),
+                wickets: parseInt(bowlMatch[5]),
+                economy: parseFloat(bowlMatch[6])
+              });
+            }
+
+            // Extract extras
+            const extrasMatch = searchBlock.match(/"extrasData":\{[^}]*"total":(\d+)[^}]*"bpieces":(\d+)[^}]*"legByes":(\d+)[^}]*"wpieces":(\d+)[^}]*"noBalls":(\d+)/);
+
+            // Extract fall of wickets
+            const fow = [];
+            const fowRegex = /"fowId":(\d+)[^}]*?"batName":"([^"]+)"[^}]*?"wktNbr":(\d+)[^}]*?"wktOver":"?([0-9.]+)"?[^}]*?"wktRuns":(\d+)/g;
+            let fowMatch;
+            while ((fowMatch = fowRegex.exec(searchBlock)) !== null) {
+              fow.push({
+                wicket: parseInt(fowMatch[3]),
+                batsman: fowMatch[2],
+                score: parseInt(fowMatch[5]),
+                overs: fowMatch[4]
+              });
+            }
+
+            if (batsmen.length > 0 || bowlers.length > 0) {
+              scorecard.innings.push({
+                inningsId: inningsId,
+                battingTeam: btMatch[2],
+                battingTeamShort: btMatch[3],
+                batsmen: batsmen,
+                bowlers: bowlers,
+                extras: extrasMatch ? {
+                  total: parseInt(extrasMatch[1]),
+                  byes: parseInt(extrasMatch[2]),
+                  legByes: parseInt(extrasMatch[3]),
+                  wides: parseInt(extrasMatch[4]),
+                  noBalls: parseInt(extrasMatch[5])
+                } : null,
+                fallOfWickets: fow
+              });
+            }
+          }
+        } catch (e) {
+          console.log('  Scorecard parse error:', e.message);
+        }
+      }
+    }
+
+    return scorecard;
+  } catch (e) {
+    console.log('  Could not fetch scorecard page:', e.message);
+    return null;
+  }
+}
+
+// ========== CREX.COM PROVIDER ==========
+
+// Parse the Angular SSR transfer-state JSON embedded in CREX pages
+function parseCrexTransferState(html) {
+  const startTag = '<script id="app-root-state"';
+  const startIdx = html.indexOf(startTag);
+  if (startIdx < 0) return null;
+
+  const tagEnd = html.indexOf('>', startIdx);
+  const scriptEnd = html.indexOf('</script>', tagEnd);
+  if (tagEnd < 0 || scriptEnd < 0) return null;
+
+  const raw = html.substring(tagEnd + 1, scriptEnd);
+  // CREX encodes quotes as &q; apostrophes as &s; ampersands as &a;
+  const decoded = raw
+    .replace(/&q;/g, '"')
+    .replace(/&s;/g, "'")
+    .replace(/&a;/g, '&')
+    .replace(/&l;/g, '<')
+    .replace(/&g;/g, '>');
+
+  try {
+    return JSON.parse(decoded);
+  } catch (e) {
+    console.log('  CREX transfer-state JSON parse error:', e.message);
+    return null;
+  }
+}
+
+// Build player name lookup from mapping data
+function buildCrexPlayerMap(mappingData) {
+  const map = {};
+  if (mappingData && mappingData.p) {
+    mappingData.p.forEach(p => { map[p.f_key] = p.n; });
+  }
+  return map;
+}
+
+// Main CREX fetch and parse function
+async function fetchCrexScore() {
+  try {
+    console.log(`\n[CREX] Fetching at ${new Date().toLocaleTimeString()}...`);
+
+    const html = await fetchUrl(matchUrl);
+
+    if (html.length < 1000) {
+      console.log('  HTML too small, using cached data');
+      return;
+    }
+
+    const state = parseCrexTransferState(html);
+    if (!state) {
+      console.log('  No CREX transfer-state found');
+      scoreData.error = 'Could not parse CREX page data';
+      return;
+    }
+
+    // Main live data blob (key varies but always contains api-v1.com)
+    const liveKey = Object.keys(state).find(k => k.includes('api-v1.com'));
+    const live = liveKey ? state[liveKey] : null;
+
+    // Match metadata
+    const metaKey = Object.keys(state).find(k => k.includes('getMatchMetaData'));
+    const meta = metaKey ? state[metaKey] : null;
+    const metaObj = Array.isArray(meta) && meta.length > 0 ? meta[0] : (meta || {});
+
+    // Player/team mapping
+    const mapKey = Object.keys(state).find(k => k.includes('liveparsing'));
+    const mapping = mapKey ? state[mapKey] : null;
+    const playerMap = buildCrexPlayerMap(mapping);
+
+    // Team mapping from oddview or liveparsing
+    const oddKey = Object.keys(state).find(k => k.includes('oddview'));
+    const oddData = oddKey ? state[oddKey] : null;
+    const teamList = (mapping && mapping.t) || (oddData && oddData.t) || [];
+    const teamMap = {};
+    teamList.forEach(t => { teamMap[t.f_key] = t; });
+
+    // Series info
+    const seriesList = (mapping && mapping.s) || [];
+    const series = seriesList.length > 0 ? seriesList[0] : {};
+
+    // Ball-by-ball commentary
+    const commKey = Object.keys(state).find(k => k.includes('getBallFeeds'));
+    const ballFeeds = commKey ? state[commKey] : [];
+
+    if (!live) {
+      console.log('  No live data found in CREX state');
+      scoreData.error = 'No live data in CREX page';
+      return;
+    }
+
+    // ---- Build scoreData from CREX live blob ----
+    scoreData.provider = 'crex';
+
+    // Match info
+    scoreData.matchInfo = {
+      description: `${live.team1_f_n || metaObj.team2 || '--'} vs ${live.team2_f_n || metaObj.team1 || '--'}, ${series.sn || series.n || ''}`,
+      format: live.mt || live.fo || '',
+      status: live.comment1 || '',
+      venue: metaObj.v || '',
+      state: live.status === 1 ? 'In Progress' : (live.status === 2 ? 'Complete' : 'Upcoming'),
+      toss: live.comment1 || '',
+      result: live.status === 2 ? (live.comment1 || '') : ''
+    };
+
+    // Team info with flags, jerseys, gradients
+    const t1key = live.team1_fkey || metaObj.team2_fkey || '';
+    const t2key = live.team2_fkey || metaObj.team1_fkey || '';
+    scoreData.team1 = {
+      name: live.team1_f_n || metaObj.team2 || '--',
+      shortName: live.team1short || live.team1 || '--',
+      id: t1key,
+      flagUrl: live.team1flag || (t1key ? `https://cricketvectors.akamaized.net/Teams/${t1key}.png` : ''),
+      jerseyUrl: live.t1Jerimage || '',
+      gradient: live.team1Gradient || '',
+      colors: teamMap[t1key] || {}
+    };
+    scoreData.team2 = {
+      name: live.team2_f_n || metaObj.team1 || '--',
+      shortName: live.team2short || live.team2 || '--',
+      id: t2key,
+      flagUrl: live.team2flag || (t2key ? `https://cricketvectors.akamaized.net/Teams/${t2key}.png` : ''),
+      jerseyUrl: live.t2Jerimage || '',
+      gradient: live.team2Gradient || '',
+      colors: teamMap[t2key] || {}
+    };
+
+    // Innings data
+    const innings = [];
+    if (live.score1) {
+      const parts = live.score1.split('-');
+      innings.push({
+        id: 1,
+        battingTeamId: t1key,
+        battingTeam: live.team1_f_n || live.team1 || '--',
+        battingTeamShort: live.team1short || live.team1 || '--',
+        score: parseInt(parts[0]) || 0,
+        wickets: parseInt(parts[1]) || 0,
+        overs: parseFloat(live.over1) || 0,
+        isDeclared: false,
+        runRate: live.crr || '0.00'
+      });
+    }
+    if (live.score2) {
+      const parts = live.score2.split('-');
+      innings.push({
+        id: 2,
+        battingTeamId: t2key,
+        battingTeam: live.team2_f_n || live.team2 || '--',
+        battingTeamShort: live.team2short || live.team2 || '--',
+        score: parseInt(parts[0]) || 0,
+        wickets: parseInt(parts[1]) || 0,
+        overs: parseFloat(live.over2) || 0,
+        isDeclared: false,
+        runRate: '0.00'
+      });
+    }
+    scoreData.innings = innings;
+    scoreData.currentInnings = live.inning || innings.length;
+
+    // Batsman striker / non-striker
+    const striker = live.os1 === 1 ? 1 : 2;
+    const nonStriker = striker === 1 ? 2 : 1;
+
+    scoreData.miniscore = {
+      inningsId: live.inning || 1,
+      battingTeam: {
+        id: t1key,
+        score: innings.length > 0 ? innings[innings.length - 1].score : 0,
+        wickets: innings.length > 0 ? innings[innings.length - 1].wickets : 0
+      },
+      batsmanStriker: {
+        name: live['pname' + striker] || '--',
+        fullName: live['player_full_name' + striker] || '',
+        fkey: live['p' + striker + 'f'] || '',
+        imageUrl: live['b' + striker + 'image'] || '',
+        runs: parseInt(live['run' + striker]) || 0,
+        balls: parseInt((live['ball' + striker] || '0').replace(/[()]/g, '')) || 0,
+        fours: parseInt(live['four' + striker]) || 0,
+        sixes: parseInt(live['six' + striker]) || 0,
+        strikeRate: parseFloat(live['sr' + striker]) || 0,
+        isImpact: live['isImpact' + striker] || false
+      },
+      batsmanNonStriker: {
+        name: live['pname' + nonStriker] || '--',
+        fullName: live['player_full_name' + nonStriker] || '',
+        fkey: live['p' + nonStriker + 'f'] || '',
+        imageUrl: live['b' + nonStriker + 'image'] || '',
+        runs: parseInt(live['run' + nonStriker]) || 0,
+        balls: parseInt((live['ball' + nonStriker] || '0').replace(/[()]/g, '')) || 0,
+        fours: parseInt(live['four' + nonStriker]) || 0,
+        sixes: parseInt(live['six' + nonStriker]) || 0,
+        strikeRate: parseFloat(live['sr' + nonStriker]) || 0,
+        isImpact: live['isImpact' + nonStriker] || false
+      },
+      bowlerStriker: {
+        name: live.bname || '--',
+        fullName: live.bowler_full_name || '',
+        fkey: live.b || '',
+        imageUrl: live.b3image || '',
+        overs: live.bover || '0',
+        maidens: 0,
+        runs: parseInt((live.bwr || '0-0').split('-')[1]) || 0,
+        wickets: parseInt((live.bwr || '0-0').split('-')[0]) || 0,
+        economy: parseFloat(live.beco) || 0,
+        figures: live.bwr || '0-0'
+      },
+      bowlerNonStriker: live.lbname2 ? {
+        name: live.lbname2 || '--',
+        overs: (live.lbover2 || '0').replace(/[()]/g, ''),
+        runs: parseInt((live.lbwicket2 || '0-0').split('-')[1]) || 0,
+        wickets: parseInt((live.lbwicket2 || '0-0').split('-')[0]) || 0,
+        figures: live.lbwicket2 || '0-0'
+      } : null,
+      overs: innings.length > 0 ? innings[innings.length - 1].overs : 0,
+      target: 0,
+      partnership: {
+        runs: live.partnerruns || 0,
+        balls: live.partnerballs || 0
+      },
+      currentRunRate: parseFloat(live.crr) || 0,
+      requiredRunRate: live.rrr === '--' ? 0 : (parseFloat(live.rrr) || 0),
+      lastWicket: live.lwname1 ? {
+        name: live.lwname1,
+        fkey: live.lwfkey || '',
+        runs: live.lwrun1 || '0',
+        balls: live.lwball1 || '(0)',
+        slug: live.lwSlug || ''
+      } : null,
+      recentOvers: '',
+      lastBowler: live.lbname ? {
+        name: live.lbname,
+        figures: live.lbwicket || '0-0',
+        overs: live.lbover || '(0)'
+      } : null,
+      event: '',
+      remRunsToWin: 0,
+      oversRemaining: null,
+      status: live.comment1 || '',
+      // CREX-specific enriched data
+      projectedScores: live.pr || null,
+      crrHistory: live.crrObj || [],
+      projectedOvers: live.projectedOvers || [],
+      projectedScoreObj: live.projectedScoreObj || {},
+      sessionData: {
+        session: live.session || 0,
+        session2: live.session2 || 0,
+        lambi: live.lambi || 0,
+        lambi2: live.lambi2 || 0,
+        sessionOvers: live.session_overs || 0,
+        lambiOvers: live.lambi_overs || 0,
+        hideSessionTable: live.hideSessionTable || false
+      },
+      rate: live.rate || '',
+      rate2: live.rate2 || ''
+    };
+
+    // Build recent overs string from lastovers array
+    if (live.lastovers && live.lastovers.length > 0) {
+      scoreData.miniscore.recentOvers = live.lastovers.map(ov =>
+        `${ov.over}: ${ov.overinfo.join(' ')} = ${ov.total}`
+      ).join(' | ');
+
+      scoreData.miniscore.overByOver = live.lastovers;
+    }
+
+    // Ball-by-ball over breakdown from rb array
+    if (live.rb && live.rb.length > 0) {
+      scoreData.miniscore.overBreakdown = live.rb.map(ov => ({
+        over: ov.o,
+        battingTeam: ov.bt,
+        innings: ov.i,
+        runs: ov.r,
+        totalScore: ov.ts,
+        balls: (ov.b || []).map(ball => ({
+          bowlerFkey: ball.bf,
+          delivery: ball.d,
+          type: ball.t,
+          result: ball.u
+        }))
+      }));
+    }
+
+    // Ball-by-ball commentary from getBallFeeds
+    if (ballFeeds && ballFeeds.length > 0) {
+      scoreData.recentCommentary = ballFeeds
+        .filter(b => b.type === 'b' || b.type === 'o')
+        .slice(0, 30)
+        .map(b => {
+          if (b.type === 'o') {
+            // Over separator
+            return {
+              type: 'over',
+              text: `End of Over ${b.o}: ${b.team} ${b.s} (${b.rb})`,
+              event: 'over_end',
+              batsman: b.p1 || '',
+              bowler: b.bowler || '',
+              overNumber: b.o,
+              batsmanScores: { p1: b.s1, p2: b.s2 },
+              bowlerFigures: b.bd
+            };
+          }
+          return {
+            type: b.type,
+            text: b.c1 || '',
+            detail: b.c2 || '',
+            event: b.b === 'w' ? 'WICKET' : (parseInt(b.b) >= 4 ? 'BOUNDARY' : ''),
+            batsman: playerMap[b.pf] || b.pf || '',
+            bowler: playerMap[b.bf] || b.bf || '',
+            runs: b.b,
+            over: b.o,
+            score: b.s,
+            delivery: b.delivery,
+            shotType: b.shot_type || 'NA',
+            wagonWheel: b.wagon_w || 'NA'
+          };
+        });
+    }
+
+    // --- TTS PROCESSING FOR CREX ---
+    if (ttsEnabled && scoreData.recentCommentary && scoreData.recentCommentary.length > 0) {
+      const latestCommentary = scoreData.recentCommentary[0];
+      if (latestCommentary.text && latestCommentary.text !== lastReadCommentaryText) {
+        console.log(`[TTS] New commentary detected for CREX: ${latestCommentary.text}`);
+        generateTTS(latestCommentary.text);
+        lastReadCommentaryText = latestCommentary.text;
+      }
+    }
+
+    // Store raw CREX data for advanced overlays
+    scoreData.crexRaw = {
+      live: live,
+      meta: metaObj,
+      playerMap: playerMap,
+      teamMap: teamMap,
+      series: series
+    };
+
+    scoreData.timestamp = new Date().toISOString();
+    scoreData.error = null;
+
+    // Log summary
+    console.log(`  [CREX] Match: ${scoreData.matchInfo.description}`);
+    if (scoreData.innings.length > 0) {
+      scoreData.innings.forEach(inn => {
+        console.log(`  Innings ${inn.id}: ${inn.battingTeamShort} ${inn.score}/${inn.wickets} (${inn.overs} ov)`);
+      });
+    }
+    if (scoreData.miniscore) {
+      const ms = scoreData.miniscore;
+      if (ms.batsmanStriker) console.log(`  Bat*: ${ms.batsmanStriker.name} ${ms.batsmanStriker.runs}(${ms.batsmanStriker.balls})`);
+      if (ms.batsmanNonStriker) console.log(`  Bat : ${ms.batsmanNonStriker.name} ${ms.batsmanNonStriker.runs}(${ms.batsmanNonStriker.balls})`);
+      if (ms.bowlerStriker) console.log(`  Bowl: ${ms.bowlerStriker.name} ${ms.bowlerStriker.figures} (${ms.bowlerStriker.overs} ov)`);
+      console.log(`  CRR: ${ms.currentRunRate} | RRR: ${ms.requiredRunRate || '--'}`);
+      if (ms.recentOvers) console.log(`  Recent: ${ms.recentOvers}`);
+    }
+    console.log(`  Status: ${scoreData.matchInfo.status || 'Live'}`);
+
+  } catch (e) {
+    scoreData.error = 'CREX fetch error: ' + e.message;
+    console.error('[CREX] Fetch error:', e.message);
+  }
+}
+
+// ========== CRICKETFASTLIVELINE.IN (CFLL) PROVIDER ==========
+
+// Cache for the CFLL Next.js build ID (changes on deploys)
+let cfllBuildId = null;
+let cfllBuildIdFetchedAt = 0;
+const CFLL_BUILDID_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Extract match slug and ID from CFLL URL
+function extractCfllInfo(cfllUrl) {
+  // URL pattern: /live-score/{slug}/{matchId}
+  const m = cfllUrl.match(/\/live-score\/([^\/]+)\/([^\/\?]+)/);
+  if (!m) return null;
+  return { slug: m[1], matchId: m[2] };
+}
+
+// Discover the Next.js build ID from CFLL pages
+async function fetchCfllBuildId() {
+  // Return cached if fresh
+  if (cfllBuildId && (Date.now() - cfllBuildIdFetchedAt) < CFLL_BUILDID_TTL) {
+    return cfllBuildId;
+  }
+  try {
+    const html = await fetchUrl('https://cricketfastliveline.in/');
+    // Look for /_next/data/{buildId}/ in script tags or __NEXT_DATA__
+    const m = html.match(/\/_next\/data\/([a-zA-Z0-9_-]+)\//) ||
+      html.match(/"buildId"\s*:\s*"([^"]+)"/);
+    if (m) {
+      cfllBuildId = m[1];
+      cfllBuildIdFetchedAt = Date.now();
+      console.log(`  [CFLL] Discovered buildId: ${cfllBuildId}`);
+      return cfllBuildId;
+    }
+    console.log('  [CFLL] Could not find buildId in homepage');
+    return null;
+  } catch (e) {
+    console.log('  [CFLL] BuildId fetch error:', e.message);
+    return cfllBuildId; // return stale if available
+  }
+}
+
+// Decompress base64+zlib postData from CFLL Next.js endpoint
+function decompressCfllData(b64str) {
+  return new Promise((resolve, reject) => {
+    const buf = Buffer.from(b64str, 'base64');
+    zlib.inflate(buf, (err, result) => {
+      if (err) return reject(err);
+      try {
+        resolve(JSON.parse(result.toString('utf8')));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  });
+}
+
+// Main CFLL fetch and parse function
+async function fetchCfllScore() {
+  try {
+    console.log(`\n[CFLL] Fetching at ${new Date().toLocaleTimeString()}...`);
+
+    const info = extractCfllInfo(matchUrl);
+    if (!info) {
+      scoreData.error = 'Could not parse CFLL URL — expected /live-score/{slug}/{matchId}';
+      return;
+    }
+
+    const buildId = await fetchCfllBuildId();
+    if (!buildId) {
+      scoreData.error = 'Could not discover CFLL build ID';
+      return;
+    }
+
+    const apiUrl = `https://cricketfastliveline.in/_next/data/${buildId}/live-score/${info.slug}/${info.matchId}.json`;
+    const raw = await fetchUrl(apiUrl);
+
+    let json;
+    try { json = JSON.parse(raw); } catch (e) {
+      // Build ID may have changed — invalidate and retry next cycle
+      console.log('  [CFLL] JSON parse failed — buildId may be stale, invalidating');
+      cfllBuildId = null;
+      cfllBuildIdFetchedAt = 0;
+      scoreData.error = 'CFLL response not JSON — buildId may have changed';
+      return;
+    }
+
+    if (!json.pageProps || !json.pageProps.postData) {
+      scoreData.error = 'CFLL response missing pageProps.postData';
+      return;
+    }
+
+    // Decode the compressed payload
+    let data;
+    try {
+      data = await decompressCfllData(json.pageProps.postData);
+    } catch (e) {
+      scoreData.error = 'CFLL decompress error: ' + e.message;
+      return;
+    }
+
+    const match = Array.isArray(data) ? data[0] : data;
+    if (!match) {
+      scoreData.error = 'CFLL: no match data in decoded payload';
+      return;
+    }
+
+    const ds = match.datases || {};
+    const live = match.statesdata || {};
+    const mi = (match.matchinfodata && match.matchinfodata[0]) || {};
+    const comm = match.commentrydata || [];
+    const teamsInfo = ds.teams || {};
+    const teamA = teamsInfo.a || {};
+    const teamB = teamsInfo.b || {};
+
+    // ---- Provider ----
+    scoreData.provider = 'cfll';
+
+    // ---- Match Info ----
+    scoreData.matchInfo = {
+      description: ds.short_name || ds.name || `${match.bt || '--'} vs ${match.bot || '--'}`,
+      format: ds.format || match.format || '',
+      status: live.message || live.message_text || (ds.status === 'started' ? 'In Progress' : ds.status || ''),
+      venue: ds.venue || mi.venue || match.venue || '',
+      state: ds.status === 'started' ? 'In Progress' : (ds.status === 'completed' ? 'Complete' : (ds.status || '')),
+      toss: ds.toss ? `${ds.toss} won the toss and chose to ${ds.decision || 'bat'}` : '',
+      result: live.message || live.message_text || ds.result || ''
+    };
+
+    // ---- Team info with flag images from GCS ----
+    const t1Key = teamA.key || ds.t1_id || '';
+    const t2Key = teamB.key || ds.t2_id || '';
+    const gcsBase = 'https://storage.googleapis.com/download/storage/v1/b/firestore-cfll.appspot.com/o/teams%2F';
+
+    scoreData.team1 = {
+      name: teamA.name || match.bt || ds.bt || '--',
+      shortName: teamA.sn || teamA.abbr || ds.bsn || '--',
+      id: t1Key,
+      flagUrl: t1Key ? `${gcsBase}${encodeURIComponent(t1Key)}.png?alt=media` : '',
+      jerseyUrl: '',
+      gradient: ds.t1_colour_primary || '',
+      colors: { primary: ds.t1_colour_primary || '', secondary: ds.t1_colour_secondary || '' }
+    };
+    scoreData.team2 = {
+      name: teamB.name || match.bot || ds.bot || '--',
+      shortName: teamB.sn || teamB.abbr || ds.bosn || '--',
+      id: t2Key,
+      flagUrl: t2Key ? `${gcsBase}${encodeURIComponent(t2Key)}.png?alt=media` : '',
+      jerseyUrl: '',
+      gradient: ds.t2_colour_primary || '',
+      colors: { primary: ds.t2_colour_primary || '', secondary: ds.t2_colour_secondary || '' }
+    };
+
+    // ---- Innings ----
+    const currentInning = parseInt(ds.inning_id || live.inning_id) || 1;
+    const innings = [];
+
+    // Current batting team innings
+    innings.push({
+      id: currentInning,
+      battingTeamId: ds.curr_bt_tid || t1Key,
+      battingTeam: ds.bt || teamA.name || '--',
+      battingTeamShort: ds.bsn || teamA.sn || '--',
+      score: parseInt(live.run || ds.run) || 0,
+      wickets: parseInt(live.wicket || ds.wicket) || 0,
+      overs: parseFloat(live.over || ds.over) || 0,
+      isDeclared: false,
+      runRate: ds.team_1_crr || '0.00'
+    });
+
+    // Other team innings (if target exists = 2nd innings)
+    if (ds.other_team_score) {
+      innings.unshift({
+        id: currentInning - 1 || 1,
+        battingTeamId: ds.curr_bt_tid === t1Key ? t2Key : t1Key,
+        battingTeam: ds.bot || teamB.name || '--',
+        battingTeamShort: ds.bosn || teamB.sn || '--',
+        score: parseInt(ds.other_team_score) || 0,
+        wickets: parseInt(ds.other_team_wicket) || 0,
+        overs: parseFloat(ds.other_team_overs) || 0,
+        isDeclared: false,
+        runRate: '0.00'
+      });
+    }
+
+    scoreData.innings = innings;
+    scoreData.currentInnings = currentInning;
+
+    // ---- Determine striker (strick field: strick_1 or strick_2) ----
+    const isStriker1 = (live.strick === 'strick_1');
+    const strikerLabel = isStriker1 ? '1' : '2';
+    const nonStrikerLabel = isStriker1 ? '2' : '1';
+
+    // ---- Miniscore ----
+    const currentInn = innings[innings.length - 1] || {};
+    const target = parseInt(ds.target || live.target) || 0;
+    const crr = parseFloat(ds.team_1_crr) || (currentInn.overs > 0 ? (currentInn.score / currentInn.overs).toFixed(2) : 0);
+    // Calculate RRR if chasing
+    let rrr = 0;
+    if (target > 0 && currentInning >= 2) {
+      const remaining = target - currentInn.score;
+      const maxBalls = ds.format === 't20' ? 120 : (ds.format === 'odi' ? 300 : 0);
+      const ballsBowled = Math.floor(currentInn.overs) * 6 + Math.round((currentInn.overs % 1) * 10);
+      const ballsLeft = maxBalls - ballsBowled;
+      if (ballsLeft > 0) rrr = ((remaining / ballsLeft) * 6).toFixed(2);
+    }
+
+    // Helper: build CFLL player image URL from player key
+    // Uses same GCS bucket pattern as team flags (teams%2F → players%2F)
+    const cfllPlayerImg = (playerKey) =>
+      playerKey ? `https://storage.googleapis.com/download/storage/v1/b/firestore-cfll.appspot.com/o/players%2F${encodeURIComponent(playerKey)}.png?alt=media` : '';
+
+    scoreData.miniscore = {
+      inningsId: currentInning,
+      battingTeam: {
+        id: ds.curr_bt_tid || t1Key,
+        score: currentInn.score || 0,
+        wickets: currentInn.wickets || 0
+      },
+      batsmanStriker: (live['batsman_' + strikerLabel] && live['batsman_' + strikerLabel] !== '-') ? {
+        name: live['batsman_' + strikerLabel] || '--',
+        fullName: live['batsman_' + strikerLabel] || '',
+        playerKey: live['batsman_' + strikerLabel + '_playerId'] || '',
+        imageUrl: cfllPlayerImg(live['batsman_' + strikerLabel + '_playerId']),
+        runs: parseInt(live['batsman_' + strikerLabel + '_run']) || 0,
+        balls: parseInt(live['batsman_' + strikerLabel + '_ball']) || 0,
+        fours: parseInt(live['batsman_' + strikerLabel + '_fours']) || 0,
+        sixes: parseInt(live['batsman_' + strikerLabel + '_sixis']) || 0,
+        strikeRate: parseFloat(live['batsman_' + strikerLabel + '_strike_rate']) || 0
+      } : null,
+      batsmanNonStriker: (live['batsman_' + nonStrikerLabel] && live['batsman_' + nonStrikerLabel] !== '-') ? {
+        name: live['batsman_' + nonStrikerLabel] || '--',
+        fullName: live['batsman_' + nonStrikerLabel] || '',
+        playerKey: live['batsman_' + nonStrikerLabel + '_playerId'] || '',
+        imageUrl: cfllPlayerImg(live['batsman_' + nonStrikerLabel + '_playerId']),
+        runs: parseInt(live['batsman_' + nonStrikerLabel + '_run']) || 0,
+        balls: parseInt(live['batsman_' + nonStrikerLabel + '_ball']) || 0,
+        fours: parseInt(live['batsman_' + nonStrikerLabel + '_fours']) || 0,
+        sixes: parseInt(live['batsman_' + nonStrikerLabel + '_sixis']) || 0,
+        strikeRate: parseFloat(live['batsman_' + nonStrikerLabel + '_strike_rate']) || 0
+      } : null,
+      bowlerStriker: live.bowler ? {
+        name: live.bowler || '--',
+        fullName: live.bowler_sname || live.bowler || '',
+        playerKey: live.bowler_playerId || '',
+        imageUrl: cfllPlayerImg(live.bowler_playerId),
+        overs: live.bowler_over || '0',
+        maidens: parseInt(live.bowler_maidan) || 0,
+        runs: parseInt(live.bowler_run) || 0,
+        wickets: parseInt(live.bowler_wicket) || 0,
+        economy: parseFloat(live.bowler_economy_rate) || 0,
+        figures: `${live.bowler_wicket || 0}-${live.bowler_run || 0}`
+      } : null,
+      bowlerNonStriker: null,
+      overs: currentInn.overs || 0,
+      target: target,
+      partnership: {
+        runs: 0,
+        balls: 0
+      },
+      currentRunRate: parseFloat(crr) || 0,
+      requiredRunRate: parseFloat(rrr) || 0,
+      lastWicket: live.lastwicket ? {
+        name: live.lastwicket.name || '',
+        runs: live.lastwicket.run || '0',
+        balls: `(${live.lastwicket.ball || '0'})`
+      } : null,
+      recentOvers: '',
+      lastBall: (live.balls_array && live.balls_array.length > 0) ? live.balls_array[live.balls_array.length - 1] : null,
+      ballsArray: live.balls_array || [],
+      event: '',
+      remRunsToWin: target > 0 ? Math.max(0, target - currentInn.score) : 0,
+      oversRemaining: null,
+      status: live.message || live.message_text || '',
+      // Weather data
+      weather: live.weather || mi.weather || null,
+      // Pitch data
+      pitch: mi.pitch || null
+    };
+
+    // ---- Recent overs from last4overs ----
+    if (live.last4overs && live.last4overs.length > 0) {
+      scoreData.miniscore.recentOvers = live.last4overs.map(ov =>
+        `Over ${ov.over}: ${(ov.balls || []).join(' ')} = ${ov.runs}`
+      ).join(' | ');
+
+      scoreData.miniscore.overByOver = live.last4overs.map(ov => ({
+        over: 'Over ' + ov.over,
+        total: parseInt(ov.runs) || 0,
+        overinfo: ov.balls || []
+      }));
+    }
+
+    // ---- Playing XI ----
+    const buildPlayingXI = (playersObj, teamKey, teamName) => {
+      if (!playersObj) return [];
+      return Object.entries(playersObj)
+        .filter(([, p]) => p.is_playing_xi)
+        .map(([key, p]) => ({
+          id: p.player_id || key,
+          name: p.fname || p.sname || p.shortname || '--',
+          shortName: p.sname || p.shortname || '',
+          imageUrl: p.img || p.image || p.photo || cfllPlayerImg(p.player_id || key),
+          role: p.role || {},
+          isCaptain: p.captain || false,
+          isKeeper: p.is_keeper || false,
+          isImpact: p.is_impact || false,
+          isSubstitute: p.is_subsitute || false,
+          batStyle: p.bat_style || '',
+          bowlStyle: p.bowl_style || '',
+          teamId: p.tid || teamKey
+        }));
+    };
+
+    scoreData.playingXI = {
+      team1: buildPlayingXI(mi.t1_players, t1Key, teamA.name),
+      team2: buildPlayingXI(mi.t2_players, t2Key, teamB.name)
+    };
+
+    // ---- Ball-by-ball commentary ----
+    if (comm.length > 0) {
+      scoreData.recentCommentary = comm.slice(0, 30).map(c => {
+        const entry = {
+          type: c.event || 'ball',
+          text: c.commentary || '',
+          event: c.event || '',
+          over: c.over,
+          ball: c.ball,
+          inning: c.inning,
+          runs: c.run || c.score || '',
+          ballsArr: c.balls_arr || []
+        };
+        // Batsman info when available
+        if (c.batsman_1) {
+          entry.batsman = {
+            name: c.batsman_1.name || '',
+            runs: c.batsman_1.runs || '0',
+            balls: c.batsman_1.balls || '0',
+            fours: c.batsman_1.fours || '0',
+            sixes: c.batsman_1.sixes || '0'
+          };
+        }
+        if (c.bowler) {
+          entry.bowler = {
+            name: c.bowler.name || '',
+            overs: c.bowler.overs || '0',
+            runs: c.bowler.runs || '0',
+            wickets: c.bowler.wickets || '0',
+            maidens: c.bowler.maidens || '0'
+          };
+        }
+        return entry;
+      });
+    }
+
+    // ---- Head-to-Head & Team Comparison ----
+    if (mi.h2h_list && mi.h2h_list.length > 0) {
+      scoreData.headToHead = mi.h2h_list.map(h => ({
+        matchId: h.match_id || '',
+        title: h.title || '',
+        relatedName: h.related_name || '',
+        teamA: h.teamAname || '',
+        teamAShort: h.t1_sn || '',
+        teamAScore: h.team_a_score || '',
+        teamAOver: h.team_a_over || '',
+        teamB: h.teamBname || '',
+        teamBShort: h.t2_sn || '',
+        teamBScore: h.team_b_score || '',
+        teamBOver: h.team_b_over || '',
+        result: h.result || '',
+        winner: h.winner_team || ''
+      }));
+    }
+
+    if (mi.team_comparison) {
+      const tc = mi.team_comparison;
+      scoreData.teamComparison = {
+        teamA: { name: tc.teamAname, wins: tc.team_a_win, avgScore: tc.team_a_avg_score, highScore: tc.team_a_high_score, lowScore: tc.team_a_low_score },
+        teamB: { name: tc.teamBname, wins: tc.team_b_win, avgScore: tc.team_b_avg_score, highScore: tc.team_b_high_score, lowScore: tc.team_b_low_score }
+      };
+    }
+
+    // ---- Match extras: umpires, pitch, weather ----
+    scoreData.matchExtras = {
+      umpires: mi.umpire || '',
+      thirdUmpire: mi.third_ump || '',
+      matchRef: mi.match_ref || '',
+      pitch: mi.pitch || null,
+      weather: live.weather || mi.weather || null,
+      paceVenue: mi.pace_venue || '',
+      spinVenue: mi.spin_venue || '',
+      tossComparison: mi.toss_comparison || null,
+      highestTotal: mi.highest_t || '',
+      lowestTotal: mi.lowest_t || '',
+      highestChased: mi.highest_chased || '',
+      lowestChased: mi.lowest_chased || ''
+    };
+
+    // ---- Store raw CFLL data for advanced overlays ----
+    scoreData.cfllRaw = {
+      datases: ds,
+      statesdata: live,
+      matchinfo: mi,
+      commentary: comm.slice(0, 50)
+    };
+
+    // Debug: log first player's fields to help identify image URL pattern
+    if (mi.t1_players) {
+      const firstPlayerKey = Object.keys(mi.t1_players)[0];
+      if (firstPlayerKey) {
+        const fp = mi.t1_players[firstPlayerKey];
+        const imgFields = Object.keys(fp).filter(k => k.includes('img') || k.includes('image') || k.includes('photo') || k.includes('pic') || k.includes('url'));
+        if (imgFields.length > 0) {
+          console.log(`  [CFLL] Player image fields found: ${imgFields.join(', ')}`);
+          imgFields.forEach(f => console.log(`    ${f}: ${fp[f]}`));
+        } else {
+          console.log(`  [CFLL] No image fields in player data. Available keys: ${Object.keys(fp).join(', ')}`);
+        }
+      }
+    }
+    // Debug: log live data player image fields
+    const liveImgFields = Object.keys(live).filter(k => k.includes('img') || k.includes('image') || k.includes('photo'));
+    if (liveImgFields.length > 0) {
+      console.log(`  [CFLL] Live player image fields: ${liveImgFields.map(f => `${f}=${live[f]}`).join(', ')}`);
+    }
+
+    scoreData.timestamp = new Date().toISOString();
+    scoreData.error = null;
+
+    // Log summary
+    console.log(`  [CFLL] Match: ${scoreData.matchInfo.description}`);
+    if (scoreData.innings.length > 0) {
+      scoreData.innings.forEach(inn => {
+        console.log(`  Innings ${inn.id}: ${inn.battingTeamShort} ${inn.score}/${inn.wickets} (${inn.overs} ov)`);
+      });
+    }
+    if (scoreData.miniscore) {
+      const ms = scoreData.miniscore;
+      if (ms.batsmanStriker) console.log(`  Bat*: ${ms.batsmanStriker.name} ${ms.batsmanStriker.runs}(${ms.batsmanStriker.balls})`);
+      if (ms.batsmanNonStriker) console.log(`  Bat : ${ms.batsmanNonStriker.name} ${ms.batsmanNonStriker.runs}(${ms.batsmanNonStriker.balls})`);
+      if (ms.bowlerStriker) console.log(`  Bowl: ${ms.bowlerStriker.name} ${ms.bowlerStriker.figures} (${ms.bowlerStriker.overs} ov)`);
+      console.log(`  CRR: ${ms.currentRunRate} | RRR: ${ms.requiredRunRate || '--'}`);
+      if (ms.recentOvers) console.log(`  Recent: ${ms.recentOvers}`);
+    }
+    if (scoreData.playingXI) {
+      const xi1 = scoreData.playingXI.team1 || [];
+      const xi2 = scoreData.playingXI.team2 || [];
+      console.log(`  Playing XI: ${scoreData.team1.shortName}(${xi1.length}) vs ${scoreData.team2.shortName}(${xi2.length})`);
+    }
+    console.log(`  Status: ${scoreData.matchInfo.status || 'Live'}`);
+
+    // --- TTS PROCESSING FOR CFLL ---
+    if (ttsEnabled && scoreData.recentCommentary && scoreData.recentCommentary.length > 0) {
+      const latestCommentary = scoreData.recentCommentary[0];
+      if (latestCommentary.text && latestCommentary.text !== lastReadCommentaryText) {
+        console.log(`[TTS] New commentary detected for CFLL: ${latestCommentary.text}`);
+        generateTTS(latestCommentary.text);
+        lastReadCommentaryText = latestCommentary.text;
+      }
+    }
+
+  } catch (e) {
+    scoreData.error = 'CFLL fetch error: ' + e.message;
+    console.error('[CFLL] Fetch error:', e.message);
+  }
+}
+
+// ========== HERO LIVE LINE PROVIDER ==========
+
+async function fetchHeroApi(path, body) {
+  return new Promise((resolve, reject) => {
+    const data = JSON.stringify(body);
+    const req = https.request({
+      hostname: 'laravel.heroliveline.com',
+      port: 443,
+      path: path,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': data.length,
+        'User-Agent': 'Mozilla/5.0'
+      },
+      timeout: 5000
+    }, res => {
+      let raw = '';
+      res.on('data', d => raw += d);
+      res.on('end', () => {
+        try { resolve(JSON.parse(raw)); } catch (e) { reject(e); }
+      });
+    }).on('error', reject);
+    req.write(data);
+    req.end();
+  });
+}
+
+// ========== HERO LIVE LINE PROVIDER ==========
+
+async function fetchHeroLiveLine() {
+  try {
+    console.log(`\n[HERO] Fetching at ${new Date().toLocaleTimeString()}...`);
+
+    const matchIdMatch = matchUrl.match(/\/(\d+)$/);
+    if (!matchIdMatch) {
+      scoreData.error = 'Could not extract match ID from Hero Live Line URL';
+      return;
+    }
+    const matchId = matchIdMatch[1];
+
+    // Fetch Live, Detail and Commentary in parallel
+    const [liveJson, detailJson, commJson] = await Promise.all([
+      fetchHeroApi('/api/web/match/matchLive', { match_id: matchId }),
+      fetchHeroApi('/api/web/match/matchDetail', { match_id: matchId }),
+      fetchHeroApi('/api/web/match/matchCommentry', { match_id: matchId })
+    ]);
+
+    if (!liveJson || liveJson.status !== "success" || !liveJson.match_live || !liveJson.match_live.match_live || !liveJson.match_live.match_live.data) {
+      scoreData.error = 'Invalid HeroLiveLine live data received';
+      return;
+    }
+
+    const hl = liveJson.match_live.match_live.data;
+
+    scoreData.provider = 'hero';
+    scoreData.matchInfo = {
+      description: hl.team_a + ' vs ' + hl.team_b,
+      format: (detailJson && detailJson.matchDetail) ? detailJson.matchDetail.match_match_type : (hl.match_type || 'T20'),
+      status: hl.result || hl.toss || hl.status || 'In progress',
+      venue: (detailJson && detailJson.matchDetail) ? detailJson.matchDetail.match_venue_name : '',
+      state: hl.result ? 'Complete' : 'In Progress',
+      toss: (detailJson && detailJson.matchDetail) ? detailJson.matchDetail.match_toss : (hl.toss || ''),
+      result: hl.result || ''
+    };
+
+    const fixHeroImg = (img) => {
+      if (!img) return '';
+      if (img.startsWith('http')) return img;
+      if (img.includes('/') || img.includes('.')) {
+        return 'https://laravel.heroliveline.com/player_img/' + img;
+      }
+      return img;
+    };
+
+    scoreData.team1 = {
+      name: hl.team_a,
+      shortName: hl.team_a_short,
+      id: hl.team_a_id,
+      flagUrl: hl.team_a_img,
+      jerseyUrl: '',
+      gradient: '#3D884B'
+    };
+
+    scoreData.team2 = {
+      name: hl.team_b,
+      shortName: hl.team_b_short,
+      id: hl.team_b_id,
+      flagUrl: hl.team_b_img,
+      jerseyUrl: '',
+      gradient: '#c91414'
+    };
+
+    const isTeam1Batting = (hl.batting_team == hl.team_a_id);
+    const currInnId = parseInt(hl.current_inning) || 1;
+
+    // Multi-inning building
+    const inningsArr = [];
+    [1, 2].forEach(innId => {
+      const key = String(innId);
+      // Check Team A in this inning key
+      if (hl.team_a_score && hl.team_a_score[key]) {
+        const s = hl.team_a_score[key];
+        if (s.score || s.wicket) {
+          inningsArr.push({
+            id: innId,
+            battingTeamId: hl.team_a_id,
+            battingTeam: hl.team_a,
+            battingTeamShort: hl.team_a_short,
+            score: s.score,
+            wickets: s.wicket,
+            overs: s.over,
+            runRate: (innId === currInnId && isTeam1Batting) ? hl.curr_rate : '0.00'
+          });
+        }
+      }
+      // Check Team B in this inning key
+      if (hl.team_b_score && hl.team_b_score[key]) {
+        const s = hl.team_b_score[key];
+        if (s.score || s.wicket) {
+          inningsArr.push({
+            id: innId,
+            battingTeamId: hl.team_b_id,
+            battingTeam: hl.team_b,
+            battingTeamShort: hl.team_b_short,
+            score: s.score,
+            wickets: s.wicket,
+            overs: s.over,
+            runRate: (innId === currInnId && !isTeam1Batting) ? hl.curr_rate : '0.00'
+          });
+        }
+      }
+    });
+    scoreData.innings = inningsArr.sort((a, b) => a.id - b.id);
+    scoreData.currentInnings = currInnId;
+
+    const battingTeamObj = isTeam1Batting ? hl.team_a_score : hl.team_b_score;
+    const scoresObj = battingTeamObj ? battingTeamObj[String(currInnId)] : { score: 0, wicket: 0, over: "0.0" };
+
+    // Recent overs formatting
+    let recentStr = '';
+    const overByOverList = [];
+    if (hl.last4overs) {
+      recentStr = hl.last4overs.map(o => `Over ${o.over}: ${(o.balls || []).join(' ')} = ${o.runs}`).join(' | ');
+      hl.last4overs.forEach(o => {
+        overByOverList.push({
+          over: 'Over ' + o.over,
+          total: o.runs,
+          overinfo: o.balls || []
+        });
+      });
+    }
+
+    const strikerBatsman = hl.batsman && hl.batsman.length > 0 ? hl.batsman[0] : null;
+    const nonStrikerBatsman = hl.batsman && hl.batsman.length > 1 ? hl.batsman[1] : null;
+
+    scoreData.miniscore = {
+      inningsId: parseInt(hl.current_inning) || 1,
+      batsmanStriker: strikerBatsman ? {
+        name: strikerBatsman.name,
+        imageUrl: fixHeroImg(strikerBatsman.img),
+        runs: strikerBatsman.run,
+        balls: strikerBatsman.ball,
+        fours: strikerBatsman.fours,
+        sixes: strikerBatsman.sixes,
+        strikeRate: strikerBatsman.strike_rate
+      } : null,
+      batsmanNonStriker: nonStrikerBatsman ? {
+        name: nonStrikerBatsman.name,
+        imageUrl: fixHeroImg(nonStrikerBatsman.img),
+        runs: nonStrikerBatsman.run,
+        balls: nonStrikerBatsman.ball,
+        fours: nonStrikerBatsman.fours,
+        sixes: nonStrikerBatsman.sixes,
+        strikeRate: nonStrikerBatsman.strike_rate
+      } : null,
+      bowlerStriker: hl.bolwer ? {
+        name: hl.bolwer.name,
+        imageUrl: fixHeroImg(hl.bolwer.img),
+        overs: hl.bolwer.over,
+        maidens: hl.bolwer.maiden,
+        runs: hl.bolwer.run,
+        wickets: hl.bolwer.wicket,
+        economy: hl.bolwer.economy || 0,
+        figures: `${hl.bolwer.wicket}-${hl.bolwer.run}`
+      } : null,
+      overs: scoresObj ? scoresObj.over : "0.0",
+      target: hl.target || 0,
+      partnership: hl.partnership ? {
+        runs: hl.partnership.run,
+        balls: hl.partnership.ball
+      } : null,
+      currentRunRate: hl.curr_rate || 0,
+      requiredRunRate: hl.rr_rate || 0,
+      lastWicket: hl.lastwicket ? { name: hl.lastwicket.player, runs: hl.lastwicket.run, balls: '(0)' } : null,
+      recentOvers: recentStr,
+      overByOver: overByOverList,
+      remRunsToWin: hl.run_need || 0,
+      status: hl.status || ''
+    };
+
+    // Populate Playing XI from detailJson
+    if (detailJson && detailJson.matchDetail && detailJson.matchDetail.match_squads && detailJson.matchDetail.match_squads.data) {
+      const squads = detailJson.matchDetail.match_squads.data;
+      const buildXI = (players) => (players || []).map(p => ({
+        id: p.player_id,
+        name: p.name,
+        role: p.play_role,
+        imageUrl: p.image
+      }));
+      scoreData.playingXI = {
+        team1: buildXI(squads.team_a.player),
+        team2: buildXI(squads.team_b.player)
+      };
+    }
+
+    // Populate Commentary from commJson
+    if (commJson && commJson.matchCommentaryData && commJson.matchCommentaryData.match_commentary && commJson.matchCommentaryData.match_commentary.data) {
+      const commRaw = commJson.matchCommentaryData.match_commentary.data;
+      const flatComm = [];
+      // Hero commentary is nested: Inning -> Over -> Balls
+      Object.keys(commRaw).reverse().forEach(inningName => {
+        const inningId = parseInt(inningName) || 1;
+        const oversObj = commRaw[inningName];
+        Object.keys(oversObj).sort((a, b) => parseInt(b) - parseInt(a)).forEach(overName => {
+          const balls = oversObj[overName];
+          balls.forEach(b => {
+            if (b.type === 1) { // Ball entry
+              flatComm.push({
+                type: 'ball',
+                text: b.data.title + '. ' + b.data.description,
+                event: b.data.runs === 'W' ? 'Wicket' : (['4', '6'].includes(b.data.runs) ? 'Boundary' : ''),
+                over: b.data.overs ? b.data.overs.split('.')[0] : '',
+                ball: b.data.overs ? b.data.overs.split('.')[1] : '',
+                inning: inningId,
+                runs: b.data.runs
+              });
+            } else if (b.type === 2) { // Over summary
+              // We can skip or add as 'over' type
+            }
+          });
+        });
+      });
+      scoreData.recentCommentary = flatComm.slice(0, 30);
+
+      // TRIGGER TTS for new commentary
+      if (ttsEnabled && scoreData.recentCommentary.length > 0) {
+        const latest = scoreData.recentCommentary[0];
+        if (latest.text !== lastReadCommentaryText) {
+          console.log(`[TTS] New commentary detected for HERO: ${latest.text}`);
+          generateTTS(latest.text);
+          lastReadCommentaryText = latest.text;
+        }
+      }
+    }
+
+    scoreData.timestamp = new Date().toISOString();
+    scoreData.error = null;
+    console.log(`  [HERO] Success: ${scoreData.matchInfo.description} | Score: ${hl.team_a_scores || hl.team_b_scores}`);
+
+  } catch (e) {
+    scoreData.error = 'HERO fetch error: ' + e.message;
+    console.error('[HERO] Fetch error:', e.message);
+  }
+}
+
+// ========== CRICBUZZ.COM PROVIDER ==========
+async function fetchCricbuzzScore() {
+  try {
+    console.log(`\nFetching at ${new Date().toLocaleTimeString()}...`);
+
+    const html = await fetchUrl(matchUrl);
+
+    if (html.length < 1000) {
+      console.log('  HTML too small, using cached data');
+      return;
+    }
+
+    // Parse the RSC payload
+    const rscData = parseRSCPayload(html);
+
+    const mini = rscData.miniscore;
+    const header = rscData.matchHeader;
+
+    if (!mini && !header) {
+      // Fallback: try og:title for basic score
+      const ogMatch = html.match(/og:title[^>]*content="([^"]+)"/);
+      if (ogMatch) {
+        const ogTitle = ogMatch[1];
+        console.log(`  Fallback og:title: ${ogTitle.substring(0, 80)}`);
+
+        // Parse basic score from og:title
+        const scoreMatch = ogTitle.match(/([A-Z]{2,4})\s+(\d+)(?:\/(\d+))?\s*(?:\(([0-9.]+)\))?.*?vs\s*([A-Z]{2,4})\s*(?:(\d+)(?:\/(\d+))?)?/);
+        if (scoreMatch) {
+          scoreData.matchInfo.status = ogTitle;
+          scoreData.error = 'Limited data - using fallback parser';
+        }
+      }
+      return;
+    }
+
+    // Build enriched score data from RSC payload
+
+    // Match info from header
+    if (header) {
+      scoreData.matchInfo = {
+        description: header.matchDescription || '',
+        format: header.matchFormat || '',
+        status: header.status || '',
+        venue: '',
+        state: header.state || '',
+        toss: header.tossResults ? `${header.tossResults.tossWinnerName} won the toss and chose to ${header.tossResults.decision}` : '',
+        result: header.result ? header.status : ''
+      };
+
+      // Extract team info
+      if (header.team1) {
+        scoreData.team1 = {
+          name: header.team1.name || header.team1.teamName || '--',
+          shortName: header.team1.shortName || header.team1.teamSName || '--',
+          id: header.team1.id || header.team1.teamId || 0
+        };
+      }
+      if (header.team2) {
+        scoreData.team2 = {
+          name: header.team2.name || header.team2.teamName || '--',
+          shortName: header.team2.shortName || header.team2.teamSName || '--',
+          id: header.team2.id || header.team2.teamId || 0
+        };
+      }
+    }
+
+    // Build innings data from matchScoreDetails
+    const matchScore = mini?.matchScoreDetails;
+    if (matchScore && matchScore.inningsScoreList) {
+      scoreData.innings = matchScore.inningsScoreList.map(inn => ({
+        id: inn.inningsId,
+        battingTeamId: inn.batTeamId,
+        battingTeam: inn.batTeamName,
+        score: inn.score,
+        wickets: inn.wickets,
+        overs: inn.overs,
+        balls: inn.ballNbr,
+        isDeclared: inn.isDeclared,
+        runRate: inn.overs > 0 ? (inn.score / inn.overs).toFixed(2) : '0.00'
+      }));
+      scoreData.currentInnings = matchScore.inningsScoreList.length;
+    }
+
+    // Enrich with miniscore live data
+    if (mini) {
+      scoreData.miniscore = {
+        inningsId: mini.inningsId,
+        battingTeam: mini.batTeam ? {
+          id: mini.batTeam.teamId,
+          score: mini.batTeam.teamScore,
+          wickets: mini.batTeam.teamWkts
+        } : null,
+        batsmanStriker: mini.batsmanStriker ? {
+          name: mini.batsmanStriker.name,
+          runs: mini.batsmanStriker.runs,
+          balls: mini.batsmanStriker.balls,
+          fours: mini.batsmanStriker.fours,
+          sixes: mini.batsmanStriker.sixes,
+          strikeRate: mini.batsmanStriker.strikeRate
+        } : null,
+        batsmanNonStriker: mini.batsmanNonStriker && mini.batsmanNonStriker.id > 0 ? {
+          name: mini.batsmanNonStriker.name,
+          runs: mini.batsmanNonStriker.runs,
+          balls: mini.batsmanNonStriker.balls,
+          fours: mini.batsmanNonStriker.fours,
+          sixes: mini.batsmanNonStriker.sixes,
+          strikeRate: mini.batsmanNonStriker.strikeRate
+        } : null,
+        bowlerStriker: mini.bowlerStriker ? {
+          name: mini.bowlerStriker.name,
+          overs: mini.bowlerStriker.overs,
+          maidens: mini.bowlerStriker.maidens,
+          runs: mini.bowlerStriker.runs,
+          wickets: mini.bowlerStriker.wickets,
+          economy: mini.bowlerStriker.economy
+        } : null,
+        bowlerNonStriker: mini.bowlerNonStriker && mini.bowlerNonStriker.id > 0 ? {
+          name: mini.bowlerNonStriker.name,
+          overs: mini.bowlerNonStriker.overs,
+          maidens: mini.bowlerNonStriker.maidens,
+          runs: mini.bowlerNonStriker.runs,
+          wickets: mini.bowlerNonStriker.wickets,
+          economy: mini.bowlerNonStriker.economy
+        } : null,
+        overs: mini.overs,
+        target: mini.target || 0,
+        partnership: mini.partnerShip ? {
+          runs: mini.partnerShip.runs,
+          balls: mini.partnerShip.balls
+        } : null,
+        currentRunRate: mini.currentRunRate || 0,
+        requiredRunRate: mini.requiredRunRate || 0,
+        lastWicket: mini.lastWicket || null,
+        recentOvers: mini.recentOvsStats || '',
+        latestPerformance: mini.latestPerformance || [],
+        event: mini.event || '',
+        remRunsToWin: mini.remRunsToWin || 0,
+        oversRemaining: mini.oversRem || null,
+        status: matchScore?.customStatus || ''
+      };
+
+      // Extract over separator data if available
+      if (mini.overSeparator) {
+        // Add imageUrl to players if they have player keys (CREX uses player ID for avatar URLs)
+        const addPlayerImageUrl = (player) => {
+          if (player && player.id) {
+            return { ...player, imageUrl: `https://cricketvectors.akamaized.net/players/org/${player.id}.png` };
+          }
+          return player;
+        };
+
+        scoreData.miniscore.overSummary = {
+          overNumber: mini.overSeparator.overNumber,
+          summary: mini.overSeparator.overSummary,
+          batTeam: mini.overSeparator.batTeamObj,
+          batStriker: addPlayerImageUrl(mini.overSeparator.batStrikerObj),
+          batNonStriker: addPlayerImageUrl(mini.overSeparator.batNonStrikerObj),
+          bowler: addPlayerImageUrl(mini.overSeparator.bowlerObj)
+        };
+      }
+    }
+
+    // Extract commentary ball-by-ball data for current over
+    if (rscData.commentary.length > 0) {
+      // Sort by timestamp descending (most recent first)
+      rscData.commentary.sort((a, b) => b.timestamp - a.timestamp);
+
+      // Get recent ball deliveries for the current over
+      const currentInningsComm = rscData.commentary.filter(c =>
+        c.inningsId === (mini?.inningsId || scoreData.currentInnings)
+      );
+
+      scoreData.recentCommentary = currentInningsComm.slice(0, 30).map(c => ({
+        type: c.type,
+        text: c.text ? c.text.replace(/<[^>]+>/g, '').substring(0, 200) : '',
+        event: c.event,
+        batsman: c.batsmanName,
+        bowler: c.bowlerName
+      }));
+    }
+
+    // --- TTS PROCESSING (Multi-ball detection) ---
+    if (ttsEnabled && scoreData.recentCommentary && scoreData.recentCommentary.length > 0) {
+      // Find all new balls since lastProcessedBallKey
+      const newItems = [];
+      for (const item of scoreData.recentCommentary) {
+        const key = item.over !== undefined ? `${item.over}.${item.ball || 0}` : item.text;
+        if (key === lastProcessedBallKey) break;
+        newItems.unshift(item); // Add to front so we process oldest first
+      }
+
+      for (const item of newItems) {
+        if (item.text && item.text !== lastReadCommentaryText) {
+          console.log(`[TTS] New event detected: "${item.text.substring(0, 50)}..."`);
+          generateTTS(item.text);
+          lastReadCommentaryText = item.text;
+        }
+        lastProcessedBallKey = item.over !== undefined ? `${item.over}.${item.ball || 0}` : item.text;
+      }
+    }
+
+    scoreData.timestamp = new Date().toISOString();
+    scoreData.error = null;
+
+    // Log summary
+    console.log(`  Match: ${scoreData.matchInfo.description} [${scoreData.matchInfo.state}]`);
+    if (scoreData.innings.length > 0) {
+      scoreData.innings.forEach(inn => {
+        console.log(`  Innings ${inn.id}: ${inn.battingTeam} ${inn.score}/${inn.wickets} (${inn.overs} ov)`);
+      });
+    }
+    if (scoreData.miniscore) {
+      const ms = scoreData.miniscore;
+      if (ms.batsmanStriker) console.log(`  Bat*: ${ms.batsmanStriker.name} ${ms.batsmanStriker.runs}(${ms.batsmanStriker.balls})`);
+      if (ms.bowlerStriker) console.log(`  Bowl: ${ms.bowlerStriker.name} ${ms.bowlerStriker.overs}-${ms.bowlerStriker.maidens}-${ms.bowlerStriker.runs}-${ms.bowlerStriker.wickets}`);
+      if (ms.recentOvers) console.log(`  Recent: ${ms.recentOvers}`);
+    }
+    console.log(`  Status: ${scoreData.matchInfo.status || scoreData.miniscore?.status || 'Live'}`);
+
+  } catch (e) {
+    scoreData.error = 'Fetch error: ' + e.message;
+    console.error('Fetch error:', e.message);
+  }
+}
+
+// Serve HTML files from disk with localhost replaced by current host
+function serveHtmlFile(res, filename) {
+  const filePath = path.join(__dirname, filename);
+  fs.readFile(filePath, 'utf8', (err, content) => {
+    if (err) {
+      res.writeHead(404);
+      res.end('{"error":"File not found"}');
+      return;
+    }
+    // Replace hardcoded localhost API URLs so overlays work on any host
+    content = content.replace(
+      /const API_URL\s*=\s*'http:\/\/localhost:5555\/score'/g,
+      "const API_URL = (window.location.protocol === 'file:' ? 'http://localhost:5555' : window.location.origin) + '/score'"
+    );
+    content = content.replace(
+      /const SERVER_URL\s*=\s*'http:\/\/localhost:5555\/score'/g,
+      "const SERVER_URL = (window.location.protocol === 'file:' ? 'http://localhost:5555' : window.location.origin) + '/score'"
+    );
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end(content);
+  });
+}
+
+// HTTP server for JSON API
+const server = http.createServer(async (req, res) => {
+  try {
+    const parsedUrl = url.parse(req.url, true);
+
+    // CORS headers
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    if (req.method === 'OPTIONS') {
+      res.writeHead(200);
+      res.end();
+      return;
+    }
+
+    // Normalize path by removing trailing slash if not root
+    let pathname = parsedUrl.pathname;
+    if (pathname.length > 1 && pathname.endsWith('/')) {
+      pathname = pathname.slice(0, -1);
+    }
+
+    // Safe JSON stringify helper
+    let jsonStr;
+    try { jsonStr = JSON.stringify(scoreData, null, 2); } catch (e) { jsonStr = '{"error":"serialize failed"}'; }
+
+    if (pathname === '/score') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(jsonStr);
+
+      // Serve HTML overlay files publicly
+    } else if (pathname === '/overlay') {
+      return serveHtmlFile(res, 'cricket_overlay.html');
+    } else if (pathname === '/stats') {
+      return serveHtmlFile(res, 'cricket_stats.html');
+    } else if (pathname === '/livebar') {
+      return serveHtmlFile(res, 'Record_with_live_bar.html');
+    } else if (pathname === '/bowling') {
+      return serveHtmlFile(res, 'bowling_attack.html');
+    } else if (pathname === '/batting') {
+      return serveHtmlFile(res, 'batting_card.html');
+    } else if (pathname === '/partnership') {
+      return serveHtmlFile(res, 'partnership_tracker.html');
+    } else if (pathname === '/manhattan') {
+      return serveHtmlFile(res, 'run_rate_graph.html');
+    } else if (pathname === '/headtohead') {
+      return serveHtmlFile(res, 'head_to_head.html');
+    } else if (pathname === '/fow') {
+      return serveHtmlFile(res, 'fow_timeline.html');
+    } else if (pathname === '/keymoments') {
+      return serveHtmlFile(res, 'key_moments.html');
+    } else if (pathname === '/thisover') {
+      return serveHtmlFile(res, 'this_over.html');
+    } else if (pathname === '/playercard') {
+      return serveHtmlFile(res, 'player_card.html');
+
+      // Change match URL without redeploying (GET /set-match?url=CRICBUZZ_OR_CREX_URL)
+    } else if (pathname === '/set-match') {
+      const newUrl = parsedUrl.query.url;
+      const provider = detectProvider(newUrl);
+      if (newUrl && (provider === 'cricbuzz' || provider === 'crex' || provider === 'cfll' || provider === 'hero')) {
+        matchUrl = newUrl;
+        console.log(`\n[MATCH CHANGED] Provider: ${provider} | New URL: ${matchUrl}`);
+        // Fetch immediately with new URL
+        try {
+          if (provider === 'crex') { await fetchCrexScore(); }
+          else if (provider === 'cfll') { await fetchCfllScore(); }
+          else if (provider === 'hero') { await fetchHeroLiveLine(); }
+          else { await fetchCricbuzzScore(); }
+        } catch (e) { }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, provider: provider, matchUrl: matchUrl, message: 'Match URL updated! Score will refresh shortly.' }));
+      } else {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid URL. Must be a cricbuzz.com, crex.com, cricketfastliveline.in, or heroliveline.com URL.' }));
+      }
+
+      // Get current match URL
+    } else if (pathname === '/get-match') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ matchUrl: matchUrl || '', provider: detectProvider(matchUrl) }));
+
+      // List custom overlays
+    } else if (pathname === '/api/overlays' && req.method === 'GET') {
+      try {
+        const files = fs.readdirSync(CUSTOM_OVERLAYS_DIR).filter(f => f.endsWith('.html'));
+        const overlays = files.map(f => {
+          const stat = fs.statSync(path.join(CUSTOM_OVERLAYS_DIR, f));
+          return {
+            name: f.replace('.html', ''),
+            filename: f,
+            size: stat.size,
+            modified: stat.mtime.toISOString(),
+            url: '/custom/' + encodeURIComponent(f.replace('.html', ''))
+          };
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ overlays }));
+      } catch (e) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ overlays: [] }));
+      }
+
+      // Upload custom overlay (POST with raw HTML body)
+    } else if (pathname === '/api/overlays' && req.method === 'POST') {
+      const name = parsedUrl.query.name;
+      if (!name || !/^[a-zA-Z0-9_\-\s]+$/.test(name)) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Invalid name. Use letters, numbers, spaces, hyphens, underscores.' }));
+        return;
+      }
+      let body = '';
+      req.on('data', chunk => {
+        body += chunk;
+        if (body.length > 5 * 1024 * 1024) { req.destroy(); } // 5MB limit
+      });
+      req.on('end', () => {
+        if (!body || body.length < 10) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'Empty or invalid HTML content.' }));
+          return;
+        }
+        const safeName = name.trim().replace(/\s+/g, '_');
+        const filePath = path.join(CUSTOM_OVERLAYS_DIR, safeName + '.html');
+        fs.writeFileSync(filePath, body, 'utf8');
+        console.log(`[CUSTOM OVERLAY] Saved: ${safeName}.html (${body.length} bytes)`);
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true, name: safeName, url: '/custom/' + safeName }));
+      });
+      return;
+
+      // Delete custom overlay
+    } else if (parsedUrl.pathname.startsWith('/api/overlays/') && req.method === 'DELETE') {
+      const name = decodeURIComponent(parsedUrl.pathname.replace('/api/overlays/', ''));
+      const filePath = path.join(CUSTOM_OVERLAYS_DIR, name + '.html');
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+        console.log(`[CUSTOM OVERLAY] Deleted: ${name}.html`);
+        res.writeHead(200);
+        res.end(JSON.stringify({ success: true }));
+      } else {
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Overlay not found.' }));
+      }
+
+      // Serve custom overlay files
+    } else if (pathname.startsWith('/custom/')) {
+      const name = decodeURIComponent(pathname.replace('/custom/', ''));
+      const filePath = path.join(CUSTOM_OVERLAYS_DIR, name + '.html');
+      if (fs.existsSync(filePath)) {
+        return serveHtmlFile(res, path.join('custom_overlays', name + '.html'));
+      } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end('{"error":"Custom overlay not found"}');
+      }
+
+    } else if (pathname === '/test_tts') {
+      const text = parsedUrl.query.text || 'This is a test of the text to speech auto play feature for the cricket dashboard.';
+      generateTTS(text);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, text: text, method: 'streamelements' }));
+
+      // Dashboard and root both serve the match control UI
+    } else if (pathname === '/' || pathname === '/dashboard') {
+      return serveHtmlFile(res, 'dashboard.html');
+
+      // Serve static assets from Data/Data/ (videos, Lottie JSON animations)
+    } else if (pathname.startsWith('/data/')) {
+      const assetRelPath = pathname.replace('/data/', '');
+      // Prevent directory traversal
+      const safeRelPath = path.normalize(assetRelPath).replace(/^(\.\.[\/\\])+/, '');
+      const assetPath = path.join(__dirname, 'Data', 'Data', safeRelPath);
+      if (!fs.existsSync(assetPath) || fs.statSync(assetPath).isDirectory()) {
+        res.writeHead(404);
+        res.end('{"error":"Asset not found"}');
+        return;
+      }
+      const ext = path.extname(assetPath).toLowerCase();
+      const mimeTypes = {
+        '.mp4': 'video/mp4',
+        '.webm': 'video/webm',
+        '.json': 'application/json',
+        '.mp3': 'audio/mpeg',
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.gif': 'image/gif'
+      };
+      const contentType = mimeTypes[ext] || 'application/octet-stream';
+      const stat = fs.statSync(assetPath);
+      const fileSize = stat.size;
+
+      // Support HTTP Range requests for video streaming
+      const range = req.headers.range;
+      if (range && contentType.startsWith('video/')) {
+        const parts = range.replace(/bytes=/, '').split('-');
+        const start = parseInt(parts[0], 10);
+        const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+        const chunkSize = end - start + 1;
+        const fileStream = fs.createReadStream(assetPath, { start, end });
+        res.writeHead(206, {
+          'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+          'Accept-Ranges': 'bytes',
+          'Content-Length': chunkSize,
+          'Content-Type': contentType
+        });
+        fileStream.pipe(res);
+      } else {
+        res.writeHead(200, {
+          'Content-Type': contentType,
+          'Content-Length': fileSize,
+          'Accept-Ranges': 'bytes',
+          'Cache-Control': 'public, max-age=3600'
+        });
+        fs.createReadStream(assetPath).pipe(res);
+      }
+      return;
+
+    } else {
+      res.writeHead(404);
+      res.end('{"error":"Not found"}');
+    }
+  } catch (err) {
+    console.error('[HTTP ERROR]', err.message);
+    try { res.writeHead(500); res.end('{"error":"Internal server error"}'); } catch (e) { }
+  }
+});
+
+// Initialize Socket.io
+const io = new Server(server, {
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
+});
+
+io.on('connection', (socket) => {
+  // Send current state on connection
+  socket.emit('tts_state', { enabled: ttsEnabled });
+
+  socket.on('toggle_tts', () => {
+    ttsEnabled = !ttsEnabled;
+    console.log(`[TTS] Auto-Play is now ${ttsEnabled ? 'ENABLED' : 'DISABLED'}`);
+    // Broadcast new state to all clients (including overlays and dashboard)
+    io.emit('tts_state', { enabled: ttsEnabled });
+  });
+});
+
+// Function to emit TTS text to overlay clients (with throttling + dedup)
+// The overlay uses the browser's SpeechSynthesis API
+let lastTTSEmitTime = 0;
+const TTS_MIN_GAP_MS = 3000;          // Minimum 3s between TTS emissions
+const ttsEmittedTexts = [];            // Rolling dedup window
+const TTS_DEDUP_WINDOW_SIZE = 20;      // Remember last 20 emitted texts
+
+function generateTTS(text) {
+  try {
+    if (!text || !text.trim()) return;
+    const clean = text.replace(/<[^>]+>/g, '').trim().substring(0, 300);
+
+    // Server-side dedup: skip if we already emitted this exact text recently
+    if (ttsEmittedTexts.includes(clean)) {
+      return; // Silently skip — don't spam logs
+    }
+
+    // Throttle: don't emit faster than every 3 seconds
+    const now = Date.now();
+    if (now - lastTTSEmitTime < TTS_MIN_GAP_MS) {
+      console.log(`[TTS] Throttled (too soon): "${clean.substring(0, 40)}..."`);
+      return;
+    }
+
+    // Track for dedup
+    ttsEmittedTexts.push(clean);
+    if (ttsEmittedTexts.length > TTS_DEDUP_WINDOW_SIZE) ttsEmittedTexts.shift();
+
+    lastTTSEmitTime = now;
+    console.log(`[TTS] Emitting: "${clean.substring(0, 60)}..."`);
+    io.emit('play_tts', { text: clean });
+  } catch (err) {
+    console.error('[TTS ERROR]', err.message);
+  }
+}
+
+// Start server and periodic updates
+async function start() {
+  // Match URL is optional at startup — user can set it from the dashboard
+  if (matchUrl) {
+    console.log(`Using match URL: ${matchUrl}\n`);
+  } else {
+    console.log('No match URL configured. Set one from the dashboard.\n');
+  }
+
+  server.on('error', (err) => {
+    console.error('[SERVER ERROR]', err.message);
+    if (err.code === 'EADDRINUSE') {
+      console.error(`Port ${PORT} is already in use. Kill the other process first.`);
+    }
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`\nCricket Score Server v2 started on port ${PORT}`);
+    console.log(`Dashboard:    http://localhost:${PORT}/`);
+    console.log(`Score API:    http://localhost:${PORT}/score`);
+    console.log(`--- Overlays ---`);
+    console.log(`Score Overlay: http://localhost:${PORT}/overlay`);
+    console.log(`Stats Panel:   http://localhost:${PORT}/stats`);
+    console.log(`Live Bar:      http://localhost:${PORT}/livebar`);
+    console.log(`Bowling:       http://localhost:${PORT}/bowling`);
+    console.log(`Batting:       http://localhost:${PORT}/batting`);
+    console.log(`Partnership:   http://localhost:${PORT}/partnership`);
+    console.log(`Manhattan:     http://localhost:${PORT}/manhattan`);
+    console.log(`Head to Head:  http://localhost:${PORT}/headtohead`);
+    console.log(`Fall of Wkts:  http://localhost:${PORT}/fow`);
+    console.log(`Key Moments:   http://localhost:${PORT}/keymoments`);
+    console.log(`This Over:     http://localhost:${PORT}/thisover`);
+    console.log(`Player Card:   http://localhost:${PORT}/playercard\n`);
+  });
+
+  // Unified fetch dispatcher — picks the right provider based on URL
+  async function fetchScore() {
+    const provider = detectProvider(matchUrl);
+    if (provider === 'crex') {
+      await fetchCrexScore();
+    } else if (provider === 'cfll') {
+      await fetchCfllScore();
+    } else if (provider === 'hero') {
+      await fetchHeroLiveLine();
+    } else {
+      await fetchCricbuzzScore();
+    }
+  }
+
+  // Initial fetch if match URL is already set
+  if (matchUrl) {
+    const provider = detectProvider(matchUrl);
+    console.log(`Provider: ${provider} — Fetching initial data...\n`);
+    try { await fetchScore(); } catch (e) { console.error('Initial fetch error:', e.message); }
+  }
+
+  // Update every 1.5 seconds for better real-time accuracy
+  setInterval(async () => {
+    if (matchUrl) {
+      try { await fetchScore(); } catch (e) { console.error('[FETCH LOOP ERROR]', e.message); }
+    }
+  }, 1500);
+}
+
+start().catch(err => {
+  console.error('Startup error:', err);
+});
